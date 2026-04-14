@@ -39,14 +39,14 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Speak text aloud using TTS (kokoro or piper backend)
+    /// Speak text aloud using TTS (kokoro, piper, chatterbox, or qwen3)
     Speak {
         /// Text to synthesize and play
         text: String,
-        /// TTS voice name (e.g. af_heart for kokoro, en/de/fr for piper)
+        /// TTS voice name (e.g. af_heart for kokoro; en_us_female_1 for qwen3; path.wav for chatterbox)
         #[arg(long, default_value = "af_heart")]
         voice: String,
-        /// TTS backend to use (kokoro, piper, or chatterbox)
+        /// TTS backend to use (kokoro, piper, chatterbox, qwen3)
         #[arg(long, default_value = "kokoro")]
         backend: String,
         /// Auto-download missing models without prompting

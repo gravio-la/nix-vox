@@ -2,8 +2,7 @@
 /target/
 **/*.rs.bk
 
-# Cargo lock for libraries
-Cargo.lock
+# Root Cargo.lock is tracked for reproducible builds (Nix, CI tooling).
 
 # Editor files
 .idea/

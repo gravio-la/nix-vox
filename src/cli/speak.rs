@@ -26,9 +26,18 @@ pub async fn run(
              Rebuild with:\n\
              \n  cargo build --features cli,chatterbox --release\n"
         ),
+        #[cfg(feature = "qwen3")]
+        "qwen3" => run_qwen3(text, voice, yes, stream).await,
+        #[cfg(not(feature = "qwen3"))]
+        "qwen3" => anyhow::bail!(
+            "Qwen3 TTS requires the 'qwen3' feature.\n\n\
+             Rebuild with:\n\
+             \n  cargo build --features cli,qwen3 --release\n"
+        ),
         other => anyhow::bail!(
             "Unknown TTS backend: '{other}'.\n\n\
-             Available backends: kokoro, piper, chatterbox"
+             Available backends: kokoro, piper, chatterbox{}",
+            if cfg!(feature = "qwen3") { ", qwen3" } else { "" },
         ),
     }
 }
@@ -199,6 +208,55 @@ async fn run_piper(text: &str, voice: &str, yes: bool, stream: bool) -> anyhow::
         .synthesize(&TtsRequest {
             text: text.to_string(),
             voice: None, // single-speaker models use the default
+            seed: None,
+        })
+        .await?;
+
+    let duration_secs = output.duration_ms as f64 / 1000.0;
+    println!(
+        "Generated {:.1}s of audio ({} samples at {} Hz)",
+        duration_secs,
+        output.audio.samples.len(),
+        output.audio.sample_rate,
+    );
+
+    println!("Playing audio...");
+    let player = vox::AudioPlayer::new()?;
+    player.play_blocking(&output.audio)?;
+    println!("Done.");
+
+    Ok(())
+}
+
+/// Map CLI `--voice` default (`af_heart` is Kokoro’s default) to a Qwen3 voice id.
+#[cfg(feature = "qwen3")]
+fn qwen3_voice_from_cli(voice: &str) -> String {
+    match voice.trim() {
+        "af_heart" => "en_us_female_1".to_string(),
+        v => v.to_string(),
+    }
+}
+
+/// Run TTS with the Qwen3 backend (multilingual CustomVoice model).
+#[cfg(feature = "qwen3")]
+async fn run_qwen3(text: &str, voice: &str, _yes: bool, stream: bool) -> anyhow::Result<()> {
+    use vox::traits::TtsBackend;
+    use vox::types::TtsRequest;
+
+    if stream {
+        eprintln!("Note: sentence streaming is not wired for Qwen3 in the CLI yet; synthesizing full utterance.");
+    }
+
+    let voice_id = qwen3_voice_from_cli(voice);
+
+    println!("Loading Qwen3 TTS (first run may download ~GB from Hugging Face)...");
+    let tts = vox::Qwen3Backend::new().await?;
+
+    println!("Synthesizing with Qwen3 (voice: {voice_id})...");
+    let output = tts
+        .synthesize(&TtsRequest {
+            text: text.to_string(),
+            voice: Some(voice_id),
             seed: None,
         })
         .await?;
