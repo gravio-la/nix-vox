@@ -1,5 +1,49 @@
 //! Handler for `vox speak` — text-to-speech synthesis and playback.
 
+use std::path::Path;
+
+use vox::types::{AudioChunk, TtsOutput};
+
+/// Write mono (or multi-channel interleaved) f32 samples in [-1, 1] to 16-bit PCM WAV.
+fn write_wav_f32(path: &Path, audio: &AudioChunk) -> anyhow::Result<()> {
+    use hound::{SampleFormat, WavSpec, WavWriter};
+
+    let spec = WavSpec {
+        channels: audio.channels.max(1) as u16,
+        sample_rate: audio.sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut w = WavWriter::create(path, spec)?;
+    for &s in &audio.samples {
+        let v = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+        w.write_sample(v)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
+fn finish_tts_output(output: &TtsOutput, output_wav: Option<&Path>) -> anyhow::Result<()> {
+    let duration_secs = output.duration_ms as f64 / 1000.0;
+    println!(
+        "Generated {:.1}s of audio ({} samples at {} Hz)",
+        duration_secs,
+        output.audio.samples.len(),
+        output.audio.sample_rate,
+    );
+    if let Some(path) = output_wav {
+        write_wav_f32(path, &output.audio)?;
+        println!("Wrote {}", path.display());
+        println!("Done.");
+        return Ok(());
+    }
+    println!("Playing audio...");
+    let player = vox::AudioPlayer::new()?;
+    player.play_blocking(&output.audio)?;
+    println!("Done.");
+    Ok(())
+}
+
 /// Run the speak command, dispatching to the appropriate backend.
 pub async fn run(
     text: &str,
@@ -7,11 +51,16 @@ pub async fn run(
     backend: &str,
     yes: bool,
     stream: bool,
+    output_wav: Option<&Path>,
 ) -> anyhow::Result<()> {
+    if stream && output_wav.is_some() {
+        anyhow::bail!("--stream cannot be used with --output; remove one of them.");
+    }
+
     match backend {
-        "kokoro" => run_kokoro(text, voice, yes, stream).await,
+        "kokoro" => run_kokoro(text, voice, yes, stream, output_wav).await,
         #[cfg(feature = "piper")]
-        "piper" => run_piper(text, voice, yes, stream).await,
+        "piper" => run_piper(text, voice, yes, stream, output_wav).await,
         #[cfg(not(feature = "piper"))]
         "piper" => anyhow::bail!(
             "Piper TTS requires the 'piper' feature.\n\n\
@@ -19,7 +68,7 @@ pub async fn run(
              \n  cargo build --features cli,piper --release\n"
         ),
         #[cfg(feature = "chatterbox")]
-        "chatterbox" => run_chatterbox(text, voice, yes, stream).await,
+        "chatterbox" => run_chatterbox(text, voice, yes, stream, output_wav).await,
         #[cfg(not(feature = "chatterbox"))]
         "chatterbox" => anyhow::bail!(
             "Chatterbox TTS requires the 'chatterbox' feature.\n\n\
@@ -27,7 +76,7 @@ pub async fn run(
              \n  cargo build --features cli,chatterbox --release\n"
         ),
         #[cfg(feature = "qwen3")]
-        "qwen3" => run_qwen3(text, voice, yes, stream).await,
+        "qwen3" => run_qwen3(text, voice, yes, stream, output_wav).await,
         #[cfg(not(feature = "qwen3"))]
         "qwen3" => anyhow::bail!(
             "Qwen3 TTS requires the 'qwen3' feature.\n\n\
@@ -83,7 +132,13 @@ fn play_streaming(
 
 /// Run TTS with the Kokoro backend.
 #[cfg(feature = "kokoro")]
-async fn run_kokoro(text: &str, voice: &str, yes: bool, stream: bool) -> anyhow::Result<()> {
+async fn run_kokoro(
+    text: &str,
+    voice: &str,
+    yes: bool,
+    stream: bool,
+    output_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     use super::models::ensure_model;
     use vox::traits::TtsBackend;
     use vox::types::TtsRequest;
@@ -108,25 +163,18 @@ async fn run_kokoro(text: &str, voice: &str, yes: bool, stream: bool) -> anyhow:
         })
         .await?;
 
-    let duration_secs = output.duration_ms as f64 / 1000.0;
-    println!(
-        "Generated {:.1}s of audio ({} samples at {} Hz)",
-        duration_secs,
-        output.audio.samples.len(),
-        output.audio.sample_rate,
-    );
-
-    println!("Playing audio...");
-    let player = vox::AudioPlayer::new()?;
-    player.play_blocking(&output.audio)?;
-    println!("Done.");
-
-    Ok(())
+    finish_tts_output(&output, output_wav)
 }
 
 /// Stub when kokoro feature is disabled.
 #[cfg(not(feature = "kokoro"))]
-async fn run_kokoro(_text: &str, _voice: &str, _yes: bool, _stream: bool) -> anyhow::Result<()> {
+async fn run_kokoro(
+    _text: &str,
+    _voice: &str,
+    _yes: bool,
+    _stream: bool,
+    _output_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "Kokoro TTS requires the 'kokoro' feature.\n\n\
          Rebuild with:\n\
@@ -136,7 +184,13 @@ async fn run_kokoro(_text: &str, _voice: &str, _yes: bool, _stream: bool) -> any
 
 /// Run TTS with the Chatterbox backend (voice cloning).
 #[cfg(feature = "chatterbox")]
-async fn run_chatterbox(text: &str, voice: &str, _yes: bool, stream: bool) -> anyhow::Result<()> {
+async fn run_chatterbox(
+    text: &str,
+    voice: &str,
+    _yes: bool,
+    stream: bool,
+    output_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     use vox::traits::TtsBackend;
     use vox::types::TtsRequest;
 
@@ -166,25 +220,18 @@ async fn run_chatterbox(text: &str, voice: &str, _yes: bool, stream: bool) -> an
         })
         .await?;
 
-    let duration_secs = output.duration_ms as f64 / 1000.0;
-    println!(
-        "Generated {:.1}s of audio ({} samples at {} Hz)",
-        duration_secs,
-        output.audio.samples.len(),
-        output.audio.sample_rate,
-    );
-
-    println!("Playing audio...");
-    let player = vox::AudioPlayer::new()?;
-    player.play_blocking(&output.audio)?;
-    println!("Done.");
-
-    Ok(())
+    finish_tts_output(&output, output_wav)
 }
 
 /// Run TTS with the Piper backend.
 #[cfg(feature = "piper")]
-async fn run_piper(text: &str, voice: &str, yes: bool, stream: bool) -> anyhow::Result<()> {
+async fn run_piper(
+    text: &str,
+    voice: &str,
+    yes: bool,
+    stream: bool,
+    output_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     use super::models::{ensure_piper_voice, piper_voice_alias};
     use vox::traits::TtsBackend;
     use vox::types::TtsRequest;
@@ -212,20 +259,7 @@ async fn run_piper(text: &str, voice: &str, yes: bool, stream: bool) -> anyhow::
         })
         .await?;
 
-    let duration_secs = output.duration_ms as f64 / 1000.0;
-    println!(
-        "Generated {:.1}s of audio ({} samples at {} Hz)",
-        duration_secs,
-        output.audio.samples.len(),
-        output.audio.sample_rate,
-    );
-
-    println!("Playing audio...");
-    let player = vox::AudioPlayer::new()?;
-    player.play_blocking(&output.audio)?;
-    println!("Done.");
-
-    Ok(())
+    finish_tts_output(&output, output_wav)
 }
 
 /// Map CLI `--voice` default (`af_heart` is Kokoro’s default) to a Qwen3 voice id.
@@ -239,7 +273,13 @@ fn qwen3_voice_from_cli(voice: &str) -> String {
 
 /// Run TTS with the Qwen3 backend (multilingual CustomVoice model).
 #[cfg(feature = "qwen3")]
-async fn run_qwen3(text: &str, voice: &str, _yes: bool, stream: bool) -> anyhow::Result<()> {
+async fn run_qwen3(
+    text: &str,
+    voice: &str,
+    _yes: bool,
+    stream: bool,
+    output_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     use vox::traits::TtsBackend;
     use vox::types::TtsRequest;
 
@@ -261,18 +301,5 @@ async fn run_qwen3(text: &str, voice: &str, _yes: bool, stream: bool) -> anyhow:
         })
         .await?;
 
-    let duration_secs = output.duration_ms as f64 / 1000.0;
-    println!(
-        "Generated {:.1}s of audio ({} samples at {} Hz)",
-        duration_secs,
-        output.audio.samples.len(),
-        output.audio.sample_rate,
-    );
-
-    println!("Playing audio...");
-    let player = vox::AudioPlayer::new()?;
-    player.play_blocking(&output.audio)?;
-    println!("Done.");
-
-    Ok(())
+    finish_tts_output(&output, output_wav)
 }

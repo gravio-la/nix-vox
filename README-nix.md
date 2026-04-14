@@ -13,12 +13,23 @@ This repository includes a `flake.nix` that provides a Rust dev shell, several b
 | Run the **default** build (Piper TTS) | `nix run .#` or `nix run .#default` |
 | Run the **Kokoro** build | `nix run .#vox-kokoro` |
 | Run the **Qwen3** build | `nix run .#vox-qwen3` |
+| Run **Qwen3 + CUDA** (Linux only, needs NVIDIA driver) | `nix run .#vox-qwen3-cuda` |
 | Build default package | `nix build .#` |
 | Build Kokoro package | `nix build .#vox-kokoro` |
 | Build Qwen3 package | `nix build .#vox-qwen3` |
+| Build Qwen3+CUDA package | `nix build .#vox-qwen3-cuda` (Linux) |
 | Developer shell (Rust, ONNX Runtime env, Piper-oriented paths) | `nix develop` |
+| Dev shell for Qwen3+CUDA (+ `mpv`) | `nix develop .#qwen3-cuda` (Linux) |
+| **Audible** Piper smoke test (plays one sentence) | `nix run .#speak-demo` |
+| **CI-style** check: build + synthesize Piper to WAV (no speaker, offline models) | `nix flake check` |
 
 After `nix build`, the binary is at `result/bin/vox` (both packages install the same executable name `vox`; the store path distinguishes them).
+
+`nix flake check` builds the default package and runs **`checks.<system>.vox-piper-speak-wav`**: it prefetches the English Piper (`en-us` / Lessac) ONNX + JSON into the store, points `VOX_MODELS_DIR` at them, runs `vox speak … --output …` to prove synthesis works without network or audio hardware.
+
+For a **local** test that **plays** audio through your default output device, use `nix run .#speak-demo` (may download the same Piper voice on first run if not cached under `~/.local/share/vox/models`).
+
+The `vox speak` command also accepts **`--output path.wav`** (`-o`) to write WAV instead of playing — useful for headless or scripting.
 
 ## Examples (`vox speak`)
 
@@ -54,6 +65,33 @@ If you omit a Qwen3-specific `--voice`, the CLI default `af_heart` is remapped t
 nix run .#vox-qwen3 -- speak "Hello from Qwen3." --backend qwen3 -y
 ```
 
+## Qwen3 speed: CPU (`vox-qwen3`) vs CUDA (`vox-qwen3-cuda`)
+
+The flake package **`vox-qwen3`** uses Cargo feature **`qwen3`** (Candle **CPU**). Quality matches the GPU build, but inference stays on the **CPU**, often with **moderate utilization** (single-threaded or memory-bound parts are normal).
+
+**Linux + NVIDIA:** **`vox-qwen3-cuda`** builds with **`qwen3-cuda`** (`nvcc` and CUDA libraries come from Nix; **CUDA is unfree**, so the flake uses `allowUnfree = true`). The derivation sets **`CUDA_COMPUTE_CAP`** (default **`80`**, i.e. Ampere) so the build does not need `nvidia-smi` in the sandbox. Override when targeting a different architecture, for example:
+
+```bash
+CUDA_COMPUTE_CAP=89 nix build .#vox-qwen3-cuda
+```
+
+At **runtime** you still need a working **NVIDIA driver**; **`libcuda.so.1`** is loaded from the driver, not from the Nix closure. The **`vox-qwen3-cuda`** wrapper prepends **`LD_LIBRARY_PATH`** with the CUDA toolkit **and** **`/run/opengl-driver/lib`** (where **NixOS** exposes the NVIDIA driver’s `libcuda`). On non-NixOS Linux, if `libcuda` is already on the default linker path, the extra entry is harmless.
+
+Example (after downloading Qwen3 weights as for CPU Qwen3):
+
+```bash
+nix run .#vox-qwen3-cuda -- speak "Hello from Qwen3 on CUDA." --backend qwen3 -y -o /tmp/t.wav
+mpv --no-video /tmp/t.wav
+```
+
+Leave **`VOX_QWEN3_DEVICE`** unset or **`auto`** to pick CUDA when this binary is built with the CUDA feature; or set **`cuda`** / **`cuda:0`**.
+
+**Without Nix:** install the driver + CUDA so `nvcc` works, then `cargo build -p vox --release --features cli,server,qwen3-cuda,pocket,chatterbox`.
+
+**Apple Silicon:** on macOS, use **`qwen3-metal`** (`cargo build … --features cli,server,qwen3-metal,pocket,chatterbox`). There is no CUDA flake output on Darwin.
+
+**Runtime override:** `VOX_QWEN3_DEVICE` wins over the config default (`auto`). Values include `auto`, `cpu`, `cuda`, `cuda:N`, and `metal`.
+
 ## Why multiple packages (`default`, `vox-kokoro`, `vox-qwen3`)
 
 Piper and Kokoro cannot be linked into **one** binary in this tree (you get a duplicate symbol such as `ph_list2`). Qwen3 is shipped as its **own** output as well (no Piper/Kokoro in that derivation), so you can switch TTS stacks without rebuilding unrelated engines.
@@ -63,8 +101,9 @@ The flake builds **three** main package variants from the same crate with differ
 - **`packages.<system>.default`** — `cli,server,piper,pocket,chatterbox` (Piper TTS).
 - **`packages.<system>.vox-kokoro`** — `cli,server,kokoro,pocket,chatterbox` (Kokoro TTS; no Piper).
 - **`packages.<system>.vox-qwen3`** — `cli,server,qwen3,pocket,chatterbox` (Qwen3 TTS; no Piper/Kokoro).
+- **`packages.x86_64-linux.vox-qwen3-cuda`** (and **`aarch64-linux`** when available) — `cli,server,qwen3-cuda,pocket,chatterbox` (Qwen3 on CUDA; Linux only).
 
-Apps mirror that: `default`, `vox-kokoro`, and `vox-qwen3` each run the corresponding package’s `vox`.
+Apps mirror that: `default`, `vox-kokoro`, `vox-qwen3`, and on Linux `vox-qwen3-cuda` each run the corresponding package’s `vox`.
 
 Qwen3 models are large and not bundled; download them separately (see upstream Qwen3-TTS / `VOX_QWEN3_MODEL_PATH` in the main docs).
 

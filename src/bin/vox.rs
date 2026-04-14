@@ -55,6 +55,9 @@ enum Commands {
         /// Stream audio sentence-by-sentence (start playing before full synthesis)
         #[arg(long, default_value_t = false)]
         stream: bool,
+        /// Write synthesized audio to a WAV file instead of playing (for CI / headless)
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
     },
     /// Chat with an LLM using your voice
     Chat {
@@ -161,8 +164,17 @@ async fn main() -> anyhow::Result<()> {
             backend,
             yes,
             stream,
+            output,
         } => {
-            cli::speak::run(&text, &voice, &backend, yes, stream).await?;
+            cli::speak::run(
+                &text,
+                &voice,
+                &backend,
+                yes,
+                stream,
+                output.as_deref(),
+            )
+            .await?;
         }
         Commands::Chat {
             model,

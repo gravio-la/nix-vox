@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use qwen3_tts::{Language, Qwen3TTS, Speaker, SynthesisOptions, auto_device};
+use qwen3_tts::{Language, Qwen3TTS, Speaker, SynthesisOptions, parse_device};
 use tokio::sync::Mutex;
 
 use crate::error::VoxError;
@@ -15,7 +15,8 @@ use crate::types::{AudioChunk, TtsOutput, TtsRequest, VoiceInfo};
 pub struct Qwen3Config {
     /// Model variant: "0.6B" or "1.7B"
     pub model_variant: String,
-    /// Device: "cuda", "metal", or "cpu"
+    /// Device string passed to [`qwen3_tts::parse_device`] if `VOX_QWEN3_DEVICE` is unset.
+    /// Use `"auto"` to pick CUDA (if compiled with `qwen3-cuda`), then Metal (`qwen3-metal`), else CPU.
     pub device: String,
     /// Default voice to use when none is specified
     pub default_voice: String,
@@ -29,7 +30,7 @@ impl Default for Qwen3Config {
     fn default() -> Self {
         Self {
             model_variant: "0.6B".into(),
-            device: Self::select_device(),
+            device: "auto".into(),
             default_voice: "en_us_female_1".into(),
             speed: 1.0,
             temperature: 0.6,
@@ -37,44 +38,9 @@ impl Default for Qwen3Config {
     }
 }
 
-impl Qwen3Config {
-    /// Select the best available device (Metal > CUDA > CPU)
-    fn select_device() -> String {
-        // Check environment variable override
-        if let Ok(device) = std::env::var("VOX_QWEN3_DEVICE") {
-            return device;
-        }
-
-        // Auto-detect best available device
-        // Prioritize Metal on macOS (M1/M2/M3 chips)
-        #[cfg(all(target_os = "macos", feature = "qwen3-metal"))]
-        {
-            if Self::is_metal_available() {
-                return "metal".to_string();
-            }
-        }
-
-        #[cfg(feature = "qwen3-cuda")]
-        {
-            if Self::is_cuda_available() {
-                return "cuda".to_string();
-            }
-        }
-
-        "cpu".to_string()
-    }
-
-    #[cfg(feature = "qwen3-cuda")]
-    fn is_cuda_available() -> bool {
-        // TODO: Actual CUDA detection logic
-        false
-    }
-
-    #[cfg(feature = "qwen3-metal")]
-    fn is_metal_available() -> bool {
-        // Metal is always available on macOS (M1+, Intel with Metal support)
-        cfg!(target_os = "macos")
-    }
+/// Prefer `VOX_QWEN3_DEVICE`, then `config.device` (typically `"auto"`).
+fn resolve_qwen3_device_spec(config: &Qwen3Config) -> String {
+    std::env::var("VOX_QWEN3_DEVICE").unwrap_or_else(|_| config.device.clone())
 }
 
 /// Qwen3 TTS backend powered by qwen3-tts.
@@ -152,14 +118,20 @@ impl Qwen3Backend {
 
         // Convert to string for API
         let model_path_str = model_path.to_string_lossy().to_string();
+        let device_spec = resolve_qwen3_device_spec(&config);
+        tracing::info!(device_spec = %device_spec, "qwen3 device selection");
 
         // Load model (this will automatically download from HuggingFace if not cached)
         let model = tokio::task::spawn_blocking(move || -> Result<Qwen3TTS, VoxError> {
             tracing::info!(path = %model_path_str, "loading from local cache");
 
-            // Select device
-            let device = auto_device()
-                .map_err(|e| VoxError::Tts(format!("failed to select device: {e}")))?;
+            let device = parse_device(&device_spec).map_err(|e| {
+                VoxError::Tts(format!(
+                    "failed to parse device {device_spec:?}: {e}. \
+                     Hint: set VOX_QWEN3_DEVICE to auto, cpu, cuda, cuda:0, or metal \
+                     (GPU requires building with feature qwen3-cuda or qwen3-metal)."
+                ))
+            })?;
 
             // Load model from pretrained path
             let model = Qwen3TTS::from_pretrained(&model_path_str, device)

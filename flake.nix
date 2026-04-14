@@ -23,6 +23,8 @@
       voxFeaturesPiper = "cli,server,piper,pocket,chatterbox";
       voxFeaturesKokoro = "cli,server,kokoro,pocket,chatterbox";
       voxFeaturesQwen3 = "cli,server,qwen3,pocket,chatterbox";
+      # Candle + qwen3-tts with CUDA (Linux + NVIDIA). Needs nvcc at build time; libcudart at runtime.
+      voxFeaturesQwen3Cuda = "cli,server,qwen3-cuda,pocket,chatterbox";
 
       sonicLibFor =
         pkgs:
@@ -63,7 +65,11 @@
       packages = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          # CUDA toolchains (cuda_nvcc, etc.) are unfree; needed for vox-qwen3-cuda.
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
           inherit (pkgs) stdenv darwin rustPlatform llvmPackages;
           sonic-lib = sonicLibFor pkgs;
 
@@ -109,7 +115,13 @@
               features,
               withPiper,
               metaDescription,
+              withCuda ? false,
             }:
+            let
+              cudaPkgs = pkgs.cudaPackages;
+              # Merged toolkit: headers + nvcc (bindgen_cuda looks for include/cuda.h on CUDA_PATH).
+              cudaToolkit = cudaPkgs.cudatoolkit;
+            in
             rustPlatform.buildRustPackage {
               inherit pname;
               version = "0.6.0";
@@ -120,16 +132,21 @@
 
               strictDeps = true;
 
-              nativeBuildInputs = with pkgs; [
-                pkg-config
-                cmake
-                # ninja: pulls a default buildPhase that runs `ninja` on the outer drv (no build.ninja).
-                git
-                clang
-                llvmPackages.libclang
-                autoPatchelfHook
-                makeWrapper
-              ];
+              nativeBuildInputs =
+                with pkgs;
+                [
+                  pkg-config
+                  cmake
+                  # ninja: pulls a default buildPhase that runs `ninja` on the outer drv (no build.ninja).
+                  git
+                  clang
+                  llvmPackages.libclang
+                  autoPatchelfHook
+                  makeWrapper
+                ]
+                ++ lib.optionals (withCuda && stdenv.isLinux) [
+                  cudaToolkit
+                ];
 
               buildInputs =
                 with pkgs;
@@ -142,6 +159,9 @@
                   espeak-ng
                 ]
                 ++ lib.optionals stdenv.isLinux [ alsa-lib ]
+                ++ lib.optionals (withCuda && stdenv.isLinux) [
+                  cudaToolkit
+                ]
                 ++ lib.optionals stdenv.isDarwin (
                   with darwin.apple_sdk.frameworks;
                   [
@@ -158,6 +178,14 @@
                 }
                 // lib.optionalAttrs withPiper {
                   CMAKE_PREFIX_PATH = lib.makeSearchPath ":" [ sonic-lib ];
+                }
+                // lib.optionalAttrs (withCuda && stdenv.isLinux) {
+                  # cudarc + bindgen_cuda (candle-kernels): headers and nvcc via merged toolkit
+                  CUDA_HOME = "${cudaToolkit}";
+                  CUDA_PATH = "${cudaToolkit}";
+                  CUDA_ROOT = "${cudaToolkit}";
+                  # candle-kernels/bindgen_cuda: avoid nvidia-smi during sandbox builds (no GPU in drv)
+                  CUDA_COMPUTE_CAP = "80";
                 };
 
               cargoBuildFlags = [
@@ -169,6 +197,11 @@
 
               doCheck = false;
 
+              # libcudart etc. are from Nix; libcuda is only on the host (NVIDIA driver).
+              autoPatchelfIgnoreMissingDeps = lib.optionals (withCuda && stdenv.isLinux) [
+                "libcuda.so.1"
+              ];
+
               postInstall =
                 let
                   setModelsDir =
@@ -176,16 +209,25 @@
                       ''[ -z "$VOX_MODELS_DIR" ] && export VOX_MODELS_DIR="$HOME/Library/Application Support/vox/models"''
                     else
                       ''[ -z "$VOX_MODELS_DIR" ] && export VOX_MODELS_DIR="''${XDG_DATA_HOME:-$HOME/.local/share}/vox/models"'';
+                  # Toolkit libs (libcudart, …) + NixOS NVIDIA driver (libcuda.so.1 under /run/opengl-driver).
+                  cudaLibPath = lib.optionalString (withCuda && stdenv.isLinux) (
+                    " --prefix LD_LIBRARY_PATH : ${
+                      lib.makeSearchPath ":" [
+                        (lib.getLib cudaToolkit)
+                        "/run/opengl-driver/lib"
+                      ]
+                    }"
+                  );
                 in
                 if withPiper then
                   ''
                     wrapProgram $out/bin/vox \
                       --run '${setModelsDir}' \
-                      --set-default PIPER_ESPEAKNG_DATA_DIRECTORY "${pkgs.espeak-ng}/share"
+                      --set-default PIPER_ESPEAKNG_DATA_DIRECTORY "${pkgs.espeak-ng}/share"${cudaLibPath}
                   ''
                 else
                   ''
-                    wrapProgram $out/bin/vox --run '${setModelsDir}'
+                    wrapProgram $out/bin/vox --run '${setModelsDir}'${cudaLibPath}
                   '';
 
               meta = {
@@ -220,10 +262,25 @@
             metaDescription = "Local-first voice AI (Qwen3 TTS build)";
           };
         }
+        // lib.optionalAttrs stdenv.isLinux {
+          "vox-qwen3-cuda" = mkVox {
+            pname = "vox-qwen3-cuda";
+            features = voxFeaturesQwen3Cuda;
+            withPiper = false;
+            withCuda = true;
+            metaDescription = "Local-first voice AI (Qwen3 TTS, CUDA build)";
+          };
+        }
       );
 
       apps = forAllSystems (
         system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
+        in
         {
           default = {
             type = "app";
@@ -237,15 +294,73 @@
             type = "app";
             program = "${self.packages.${system}."vox-qwen3"}/bin/vox";
           };
+          # Audible smoke test (Piper): requires audio output device
+          speak-demo = {
+            type = "app";
+            program = "${
+              pkgs.writeShellScript "vox-speak-demo" ''
+                exec ${self.packages.${system}.default}/bin/vox speak \
+                  "Build test. This is Vox speaking." \
+                  --backend piper --voice en-us -y
+              ''
+            }";
+          };
+        }
+        // lib.optionalAttrs pkgs.stdenv.isLinux {
+          "vox-qwen3-cuda" = {
+            type = "app";
+            program = "${self.packages.${system}."vox-qwen3-cuda"}/bin/vox";
+          };
+        }
+      );
+
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
+          vox = self.packages.${system}.default;
+          piperOnnx = pkgs.fetchurl {
+            name = "en_US-lessac-medium.onnx";
+            url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx";
+            hash = "sha256-Xv4J5pkCGHgnr2RuGm6dJp3udp+Yd9F7FrG0buqvAZ8=";
+          };
+          piperJson = pkgs.fetchurl {
+            name = "en_US-lessac-medium.onnx.json";
+            url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json";
+            hash = "sha256-7+GcQXvtBV8taZCCSMa6ZQ+hNbyGiw5quz2hgdq2kKA=";
+          };
+        in
+        {
+          # Offline: builds default package, prefetches Piper en-us, runs synthesis to WAV (no speaker).
+          vox-piper-speak-wav = pkgs.runCommand "vox-piper-speak-wav" { } ''
+            export HOME=$(mktemp -d)
+            mkdir -p "$HOME/vox-models/piper"
+            ln -s ${piperOnnx} "$HOME/vox-models/piper/en_US-lessac-medium.onnx"
+            ln -s ${piperJson} "$HOME/vox-models/piper/en_US-lessac-medium.onnx.json"
+            export VOX_MODELS_DIR="$HOME/vox-models"
+            mkdir -p "$out"
+            ${vox}/bin/vox speak "Nix build test. Piper speaks." \
+              --backend piper --voice en-us -y \
+              --output "$out/speak-check.wav"
+            test -s "$out/speak-check.wav"
+          '';
         }
       );
 
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
           inherit (pkgs) lib stdenv darwin llvmPackages;
           sonic-lib = sonicLibFor pkgs;
+          cudaPkgs = pkgs.cudaPackages;
+          cudaToolkit = cudaPkgs.cudatoolkit;
         in
         {
           default = pkgs.mkShell {
@@ -280,6 +395,39 @@
 
             shellHook = ''
               echo "Vox dev shell (Rust $(rustc --version | cut -d' ' -f2))"
+            '';
+          };
+        }
+        // lib.optionalAttrs stdenv.isLinux {
+          qwen3-cuda = pkgs.mkShell {
+            name = "vox-qwen3-cuda";
+            inputsFrom = [ self.packages.${system}."vox-qwen3-cuda" ];
+
+            packages = with pkgs; [
+              rustc
+              cargo
+              rustfmt
+              clippy
+              mpv
+            ];
+
+            env = {
+              RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              RUST_BACKTRACE = "1";
+              LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+              ORT_STRATEGY = "system";
+              ORT_LIB_LOCATION = "${lib.getLib pkgs.onnxruntime}/lib";
+              ORT_PREFER_DYNAMIC_LINK = "1";
+              CUDA_HOME = "${cudaToolkit}";
+              CUDA_PATH = "${cudaToolkit}";
+              CUDA_ROOT = "${cudaToolkit}";
+              CUDA_COMPUTE_CAP = "80";
+            };
+
+            shellHook = ''
+              echo "Vox Qwen3+CUDA dev shell (Rust $(rustc --version | cut -d' ' -f2), nvcc: ${cudaToolkit}/bin/nvcc)"
+              echo "  nix run .#vox-qwen3-cuda -- speak \"Hello\" --backend qwen3 -y -o /tmp/t.wav"
+              echo "  mpv --no-video /tmp/t.wav"
             '';
           };
         }
