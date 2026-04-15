@@ -26,6 +26,28 @@ pub const MODELS: &[ModelInfo] = &[
         size_bytes: 2_327_524,
         kind: "VAD",
     },
+    // Multilingual Whisper (German, etc.). English-only: whisper-tiny.en.
+    ModelInfo {
+        name: "whisper-tiny",
+        filename: "ggml-tiny.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+        size_bytes: 75_000_000,
+        kind: "STT",
+    },
+    ModelInfo {
+        name: "whisper-base",
+        filename: "ggml-base.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+        size_bytes: 142_000_000,
+        kind: "STT",
+    },
+    ModelInfo {
+        name: "whisper-small",
+        filename: "ggml-small.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+        size_bytes: 466_000_000,
+        kind: "STT",
+    },
     ModelInfo {
         name: "whisper-tiny.en",
         filename: "ggml-tiny.en.bin",
@@ -241,8 +263,8 @@ pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "speaker-encoder",
         filename: "speaker_encoder.onnx",
-        url: "https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/main/model.onnx",
-        size_bytes: 43_000_000,
+        url: "https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/main/onnx/model.onnx",
+        size_bytes: 26_535_549,
         kind: "Diarization",
     },
 ];
