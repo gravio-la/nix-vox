@@ -77,6 +77,18 @@ impl AudioCapture {
                     )
                     .map_err(|e| VoxError::Audio(format!("failed to build input stream: {e}")))?
             }
+            SampleFormat::U8 => {
+                let ch = actual_channels;
+                let rate = actual_rate;
+                device
+                    .build_input_stream(
+                        &stream_config,
+                        Self::make_callback_u8(tx, chunk_size, rate, ch),
+                        |err| error!("audio stream error: {}", err),
+                        None,
+                    )
+                    .map_err(|e| VoxError::Audio(format!("failed to build input stream: {e}")))?
+            }
             other => {
                 return Err(VoxError::Audio(format!(
                     "unsupported sample format: {other:?}"
@@ -160,6 +172,31 @@ impl AudioCapture {
             // Convert i16 to f32 normalized to [-1.0, 1.0]
             for &sample in data {
                 accumulator.push(sample as f32 / i16::MAX as f32);
+            }
+            while accumulator.len() >= chunk_size {
+                let chunk_data: Vec<f32> = accumulator.drain(..chunk_size).collect();
+                let chunk = AudioChunk {
+                    samples: chunk_data,
+                    sample_rate,
+                    channels,
+                };
+                let _ = tx.try_send(chunk);
+            }
+        }
+    }
+
+    /// Build a u8 input callback (some ALSA/PipeWire devices default to U8).
+    fn make_callback_u8(
+        tx: mpsc::Sender<AudioChunk>,
+        chunk_size: usize,
+        sample_rate: u32,
+        channels: u16,
+    ) -> impl FnMut(&[u8], &cpal::InputCallbackInfo) + Send + 'static {
+        let mut accumulator: Vec<f32> = Vec::with_capacity(chunk_size);
+        move |data: &[u8], _info: &cpal::InputCallbackInfo| {
+            for &sample in data {
+                // Unsigned 8-bit centered at 128 → [-1, 1]
+                accumulator.push((sample as f32 - 128.0) / 128.0);
             }
             while accumulator.len() >= chunk_size {
                 let chunk_data: Vec<f32> = accumulator.drain(..chunk_size).collect();
