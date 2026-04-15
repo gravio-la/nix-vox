@@ -1,6 +1,6 @@
 # Nix (flake) for Vox
 
-This repository includes a `flake.nix` that provides a Rust dev shell, several build variants of the `vox` binary (Piper, Kokoro, or Qwen3 TTS), and matching `nix run` app targets. The whole layout is self-contained so you can later move **only** the Nix files (and whatever paths they reference) into a separate repo and point them at this project as a source input, without changing how Vox itself is developed.
+This repository includes a `flake.nix` that provides a Rust dev shell, several build variants of the `vox` binary (Piper, Kokoro, or Qwen3 TTS), and matching `nix run` app targets.
 
 ## Requirements
 
@@ -19,7 +19,7 @@ This repository includes a `flake.nix` that provides a Rust dev shell, several b
 | Build Qwen3 package | `nix build .#vox-qwen3` |
 | Build Qwen3+CUDA package | `nix build .#vox-qwen3-cuda` (Linux) |
 | Developer shell (Rust, ONNX Runtime env, Piper-oriented paths) | `nix develop` |
-| Dev shell for Qwen3+CUDA (+ `mpv`) | `nix develop .#qwen3-cuda` (Linux) |
+| Dev shell for Qwen3+CUDA (+ `aplay` for WAV smoke tests) | `nix develop .#qwen3-cuda` (Linux) |
 | **Audible** Piper smoke test (plays one sentence) | `nix run .#speak-demo` |
 | **CI-style** check: build + synthesize Piper to WAV (no speaker, offline models) | `nix flake check` |
 
@@ -67,6 +67,8 @@ nix run .#vox-qwen3 -- speak "Hello from Qwen3." --backend qwen3 -y
 
 ## Qwen3 speed: CPU (`vox-qwen3`) vs CUDA (`vox-qwen3-cuda`)
 
+**`CUDA_COMPUTE_CAP`:** NVIDIA’s [**compute capability**](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities) is a version number for a GPU architecture (the `sm_XX` target for device code). The Candle stack (e.g. **candle-kernels** / bindgen) reads the environment variable `CUDA_COMPUTE_CAP` at **compile time** so `nvcc` knows which architecture to build for, instead of querying `nvidia-smi`—which is unavailable or unreliable in Nix’s build sandbox, Docker, and similar environments ([Candle install notes](https://huggingface.github.io/candle/guide/installation.html)). Values are the capability in **compact form** without a dot: `80` → 8.0 (e.g. Ampere), `89` → 8.9 (e.g. many RTX 40-series). Discover yours from NVIDIA’s GPU list, or on a machine where the GPU is visible: `nvidia-smi --query-gpu=compute_cap --format=csv`. In this repo it is **first set** on the `vox` package in **`flake.nix`** (`env` when CUDA is enabled: default `CUDA_COMPUTE_CAP = "80"`).
+
 The flake package **`vox-qwen3`** uses Cargo feature **`qwen3`** (Candle **CPU**). Quality matches the GPU build, but inference stays on the **CPU**, often with **moderate utilization** (single-threaded or memory-bound parts are normal).
 
 **Linux + NVIDIA:** **`vox-qwen3-cuda`** builds with **`qwen3-cuda`** (`nvcc` and CUDA libraries come from Nix; **CUDA is unfree**, so the flake uses `allowUnfree = true`). The derivation sets **`CUDA_COMPUTE_CAP`** (default **`80`**, i.e. Ampere) so the build does not need `nvidia-smi` in the sandbox. Override when targeting a different architecture, for example:
@@ -81,7 +83,7 @@ Example (after downloading Qwen3 weights as for CPU Qwen3):
 
 ```bash
 nix run .#vox-qwen3-cuda -- speak "Hello from Qwen3 on CUDA." --backend qwen3 -y -o /tmp/t.wav
-mpv --no-video /tmp/t.wav
+aplay /tmp/t.wav
 ```
 
 Leave **`VOX_QWEN3_DEVICE`** unset or **`auto`** to pick CUDA when this binary is built with the CUDA feature; or set **`cuda`** / **`cuda:0`**.
@@ -101,11 +103,33 @@ The flake builds **three** main package variants from the same crate with differ
 - **`packages.<system>.default`** — `cli,server,piper,pocket,chatterbox` (Piper TTS).
 - **`packages.<system>.vox-kokoro`** — `cli,server,kokoro,pocket,chatterbox` (Kokoro TTS; no Piper).
 - **`packages.<system>.vox-qwen3`** — `cli,server,qwen3,pocket,chatterbox` (Qwen3 TTS; no Piper/Kokoro).
-- **`packages.x86_64-linux.vox-qwen3-cuda`** (and **`aarch64-linux`** when available) — `cli,server,qwen3-cuda,pocket,chatterbox` (Qwen3 on CUDA; Linux only).
+- **`packages.x86_64-linux.vox-qwen3-cuda`** (and **`aarch64-linux`** when available) — `cli,server,whisper,silero,qwen3-cuda,piper,pocket,chatterbox`: **Qwen3 CUDA TTS**, **Whisper STT**, **Silero VAD**, **Piper** (fallback + Live Talk), **Chatterbox**, **Pocket**; Linux only.
 
 Apps mirror that: `default`, `vox-kokoro`, `vox-qwen3`, and on Linux `vox-qwen3-cuda` each run the corresponding package’s `vox`.
 
 Qwen3 models are large and not bundled; download them separately (see upstream Qwen3-TTS / `VOX_QWEN3_MODEL_PATH` in the main docs).
+
+### Models for `vox-qwen3-cuda` (STT + VAD + optional Piper)
+
+Everything below is fetched into **`VOX_MODELS_DIR`** (default `~/.local/share/vox/models` on Linux). Use **`nix run .#vox-qwen3-cuda --`** instead of a local `cargo` build.
+
+| Need | Registry name | On disk |
+|------|-----------------|---------|
+| VAD (WebSocket listen, `vox listen`) | `silero-vad` | `silero_vad.onnx` |
+| STT **multilingual** (German, etc.) | **`whisper-tiny`**, or `whisper-base` / `whisper-small` for accuracy | `ggml-tiny.bin`, … |
+| STT **English-only** | `whisper-tiny.en` | `ggml-tiny.en.bin` |
+| **Speaker diarization** (ECAPA-style embeddings, `vox chat --diarize`, WS) | **`speaker-encoder`** | `speaker_encoder.onnx` |
+| Piper DE (tests / fallback voice) | `piper-de` and `piper-de-config` | `piper/de_DE-thorsten-medium.onnx` + `.json` |
+
+Examples:
+
+```bash
+nix run .#vox-qwen3-cuda -- models download silero-vad
+nix run .#vox-qwen3-cuda -- models download whisper-tiny
+nix run .#vox-qwen3-cuda -- models download speaker-encoder
+```
+
+Sources are the **official Vox registry** in `src/cli/models.rs` (Silero GitHub, **ggerganov/whisper.cpp** on Hugging Face, Rhasspy Piper voices). Qwen3 weights still come from **Hugging Face** (`Qwen/Qwen3-TTS-…`) into the usual HF cache.
 
 ## Environment the wrappers set
 

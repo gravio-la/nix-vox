@@ -17,14 +17,35 @@
       ];
       forAllSystems = lib.genAttrs systems;
 
+      # For `builtins.path` `filter`: keep only whitelisted paths under `rootPrefix` (relative to that root).
+      filterPathByWhitelist =
+        {
+          rootPrefix,
+          includeFilesByBaseName,
+          includeTreeRoots,
+          includeRelContains,
+        }:
+        path: type:
+        let
+          ps = toString path;
+          rel =
+            if lib.hasPrefix rootPrefix ps then lib.removePrefix rootPrefix ps else ps;
+          bn = baseNameOf rel;
+        in
+        lib.elem bn includeFilesByBaseName
+        || lib.any (d: rel == d || lib.hasPrefix "${d}/" rel) includeTreeRoots
+        || lib.any (infix: lib.hasInfix infix rel) includeRelContains;
+
       # Piper + Kokoro cannot be linked in one binary (`ph_list2` duplicate symbol). Split TTS outputs:
       # `default` = Piper; `vox-kokoro` = Kokoro; `vox-qwen3` = Qwen3 (no Piper/Kokoro in the same drv).
       # `sonicLibFor` feeds espeak-ng CMake when Piper is enabled.
       voxFeaturesPiper = "cli,server,piper,pocket,chatterbox";
       voxFeaturesKokoro = "cli,server,kokoro,pocket,chatterbox";
       voxFeaturesQwen3 = "cli,server,qwen3,pocket,chatterbox";
-      # Candle + qwen3-tts with CUDA (Linux + NVIDIA). Needs nvcc at build time; libcudart at runtime.
-      voxFeaturesQwen3Cuda = "cli,server,qwen3-cuda,pocket,chatterbox";
+      # Qwen3 TTS (CUDA) + HTTP server + Whisper STT + Silero VAD + Piper (fallback / Live Talk).
+      # `cli` already pulls whisper+silero; we list them explicitly for clarity. Piper is safe with
+      # Qwen3 (the Kokoro+Piper `ph_list2` clash does not apply here).
+      voxFeaturesQwen3Cuda = "cli,server,whisper,silero,qwen3-cuda,piper,pocket,chatterbox";
 
       sonicLibFor =
         pkgs:
@@ -77,36 +98,31 @@
             let
               rootStr = toString self;
               rootPrefix = rootStr + "/";
+              # Only these paths become derivation `src` (see `filterPathByWhitelist`).
+              includeFilesByBaseName = [
+                "Cargo.toml"
+                "Cargo.lock"
+                "build.rs"
+              ];
+              includeTreeRoots = [
+                "src"
+                "vendor"
+                "python"
+                "examples"
+                "tests"
+                "benches"
+                ".cargo"
+              ];
+              includeRelContains = [
+                "/.cargo/"
+              ];
             in
             builtins.path {
               path = self;
               name = "vox-src";
-              filter =
-                path: type:
-                let
-                  ps = toString path;
-                  rel =
-                    if lib.hasPrefix rootPrefix ps then lib.removePrefix rootPrefix ps else ps;
-                  bn = baseNameOf rel;
-                in
-                bn == "Cargo.toml"
-                || bn == "Cargo.lock"
-                || bn == "build.rs"
-                || rel == "src"
-                || lib.hasPrefix "src/" rel
-                || rel == "vendor"
-                || lib.hasPrefix "vendor/" rel
-                || rel == "python"
-                || lib.hasPrefix "python/" rel
-                || rel == "examples"
-                || lib.hasPrefix "examples/" rel
-                || rel == "tests"
-                || lib.hasPrefix "tests/" rel
-                || rel == "benches"
-                || lib.hasPrefix "benches/" rel
-                || rel == ".cargo"
-                || lib.hasPrefix ".cargo/" rel
-                || lib.hasInfix "/.cargo/" rel;
+              filter = filterPathByWhitelist {
+                inherit rootPrefix includeFilesByBaseName includeTreeRoots includeRelContains;
+              };
             };
 
           mkVox =
@@ -266,9 +282,9 @@
           "vox-qwen3-cuda" = mkVox {
             pname = "vox-qwen3-cuda";
             features = voxFeaturesQwen3Cuda;
-            withPiper = false;
+            withPiper = true;
             withCuda = true;
-            metaDescription = "Local-first voice AI (Qwen3 TTS, CUDA build)";
+            metaDescription = "Local-first voice AI (Qwen3 CUDA TTS, Whisper STT, Silero VAD, Piper)";
           };
         }
       );
@@ -408,7 +424,7 @@
               cargo
               rustfmt
               clippy
-              mpv
+              alsa-utils
             ];
 
             env = {
@@ -427,7 +443,7 @@
             shellHook = ''
               echo "Vox Qwen3+CUDA dev shell (Rust $(rustc --version | cut -d' ' -f2), nvcc: ${cudaToolkit}/bin/nvcc)"
               echo "  nix run .#vox-qwen3-cuda -- speak \"Hello\" --backend qwen3 -y -o /tmp/t.wav"
-              echo "  mpv --no-video /tmp/t.wav"
+              echo "  aplay /tmp/t.wav"
             '';
           };
         }
