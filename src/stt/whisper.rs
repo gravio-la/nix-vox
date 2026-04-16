@@ -34,10 +34,6 @@ pub struct WhisperConfig {
     pub translate: bool,
     /// Number of CPU threads (default: 4).
     pub n_threads: i32,
-    /// Segments with `no_speech_probability` above this are skipped (whisper.cpp / whisper-rs).
-    /// Live microphone audio is often borderline; `vox listen` uses ~0.78; the default for
-    /// [`WhisperBackend::from_model`] stays stricter to reduce hallucinations when no VAD gates input.
-    pub no_speech_probability_max: f32,
 }
 
 /// Whisper STT backend using whisper-rs bindings to whisper.cpp.
@@ -67,7 +63,6 @@ impl WhisperBackend {
                 language: None,
                 translate: false,
                 n_threads: 4,
-                no_speech_probability_max: 0.6,
             },
         })
     }
@@ -119,7 +114,6 @@ impl SttBackend for WhisperBackend {
         let language = self.config.language.clone();
         let translate = self.config.translate;
         let n_threads = self.config.n_threads;
-        let no_speech_probability_max = self.config.no_speech_probability_max;
         #[cfg(feature = "diarization")]
         let speaker_id = audio.speaker_id.clone();
 
@@ -146,7 +140,7 @@ impl SttBackend for WhisperBackend {
             // above this threshold are suppressed. This prevents Whisper from
             // hallucinating text for echo, noise, or silence captured during
             // Live Talk TTS playback.
-            params.set_no_speech_thold(no_speech_probability_max);
+            params.set_no_speech_thold(0.6);
 
             if let Some(ref lang) = language {
                 params.set_language(Some(lang));
@@ -164,7 +158,7 @@ impl SttBackend for WhisperBackend {
             for i in 0..num_segments {
                 if let Some(segment) = state.get_segment(i) {
                     // Skip segments that are likely non-speech (echo, noise).
-                    if segment.no_speech_probability() > no_speech_probability_max {
+                    if segment.no_speech_probability() > 0.6 {
                         tracing::debug!(
                             segment = i,
                             no_speech_prob = segment.no_speech_probability(),

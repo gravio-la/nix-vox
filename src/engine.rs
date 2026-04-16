@@ -5,7 +5,6 @@
 //! a running pipeline.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -215,8 +214,6 @@ impl VoxBuilder {
             active_session: None,
             audio_rx,
             resampler,
-            vad_frame_buf: Vec::new(),
-            last_mic_level_log: None,
             _capture: capture,
             callback,
             stats: Arc::new(Mutex::new(PipelineStats::default())),
@@ -252,10 +249,6 @@ pub struct Vox {
     active_session: Option<Box<dyn SttSession>>,
     audio_rx: mpsc::Receiver<AudioChunk>,
     resampler: AudioResampler,
-    /// Holds resampled mono samples until we have full VAD frames (see `VadBackend::frame_size`).
-    vad_frame_buf: Vec<f32>,
-    /// Last time we logged mic RMS/peak (see `process_chunk`).
-    last_mic_level_log: Option<Instant>,
     _capture: AudioCapture,
     callback: Box<dyn Fn(SttResult, VoxContext) + Send + Sync>,
     stats: Arc<Mutex<PipelineStats>>,
@@ -331,51 +324,18 @@ impl Vox {
         start_time: std::time::Instant,
     ) -> Result<(), VoxError> {
         let t_chunk = std::time::Instant::now();
-        let mut resampled = self.resampler.process(&chunk)?;
-
-        // Optional gain for quiet capture (many ALSA U8 inputs need this before Silero sees speech).
-        if let Ok(s) = std::env::var("VOX_MIC_GAIN") {
-            if let Ok(g) = s.parse::<f32>() {
-                if g > 0.0 && g <= 32.0 && (g - 1.0).abs() > f32::EPSILON {
-                    for x in &mut resampled.samples {
-                        *x = (*x * g).clamp(-1.0, 1.0);
-                    }
-                }
-            }
-        }
-
-        let now = Instant::now();
-        if self.last_mic_level_log.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(2))
-        {
-            self.last_mic_level_log = Some(now);
-            if !resampled.samples.is_empty() {
-                let n = resampled.samples.len() as f32;
-                let rms =
-                    (resampled.samples.iter().map(|s| s * s).sum::<f32>() / n).sqrt();
-                let peak = resampled
-                    .samples
-                    .iter()
-                    .copied()
-                    .map(f32::abs)
-                    .fold(0.0f32, f32::max);
-                tracing::info!(
-                    rms,
-                    peak,
-                    "mic level (16 kHz mono, after VOX_MIC_GAIN); if rms stays ~0, audio is not reaching vox"
-                );
-            }
-        }
-
+        let resampled = self.resampler.process(&chunk)?;
         let frame_size = self.vad.frame_size();
-        let out_rate = resampled.sample_rate;
-        self.vad_frame_buf.extend_from_slice(&resampled.samples);
+        let frames = resampled.samples.chunks(frame_size);
 
-        while self.vad_frame_buf.len() >= frame_size {
-            let frame_samples: Vec<f32> = self.vad_frame_buf.drain(..frame_size).collect();
+        for frame_samples in frames {
+            if frame_samples.len() < frame_size {
+                continue; // skip incomplete trailing frames
+            }
 
             let frame = AudioChunk {
-                samples: frame_samples,
-                sample_rate: out_rate,
+                samples: frame_samples.to_vec(),
+                sample_rate: resampled.sample_rate,
                 channels: 1,
             };
 
@@ -409,7 +369,6 @@ impl Vox {
             for event in events {
                 match event {
                     VadEvent::SpeechStart => {
-                        tracing::info!("VAD: speech started");
                         tracing::debug!("speech started");
                         if let Some(streaming) = &self.streaming_stt {
                             match streaming.create_session() {
@@ -419,11 +378,6 @@ impl Vox {
                         }
                     }
                     VadEvent::SpeechEnd(utterance) => {
-                        tracing::info!(
-                            duration_ms = utterance.duration_ms,
-                            samples = utterance.audio.samples.len(),
-                            "VAD: speech ended, running STT..."
-                        );
                         tracing::debug!(
                             duration_ms = utterance.duration_ms,
                             "speech ended, transcribing..."
@@ -447,14 +401,7 @@ impl Vox {
                         };
                         tracing::debug!(elapsed_us = t_stt.elapsed().as_micros(), "stt transcribe");
 
-                        if stt_result.text.is_empty() {
-                            tracing::warn!(
-                                duration_ms = utterance.duration_ms,
-                                stt_ms = stt_result.processing_time_ms,
-                                "STT returned empty text (no_speech filter, noise, or unclear audio). \
-                                 Try RUST_LOG=debug or a smaller/faster Whisper model for tests."
-                            );
-                        } else {
+                        if !stt_result.text.is_empty() {
                             tracing::info!(
                                 text = %stt_result.text,
                                 latency_ms = stt_result.processing_time_ms,

@@ -3,62 +3,49 @@
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
-use tracing::info;
 
 use crate::error::VoxError;
 use crate::types::AudioChunk;
 
 /// Resamples audio to a target sample rate and converts stereo to mono.
 ///
-/// Resampling is driven by each chunk's [`AudioChunk::sample_rate`] (the device may run at
-/// 48 kHz while the pipeline was configured for 16 kHz). If capture falls back to the
-/// device default rate, we still downsample correctly so Silero VAD sees true 16 kHz frames.
+/// If source and target rates are the same, operates in passthrough mode
+/// with zero allocation overhead for resampling.
 pub struct AudioResampler {
     resampler: Option<SincFixedIn<f32>>,
-    /// Source rate the current `resampler` was built for (`None` if passthrough).
-    active_source_rate: Option<u32>,
+    #[allow(dead_code)]
+    source_rate: u32,
     target_rate: u32,
 }
 
 impl AudioResampler {
-    /// Create a resampler. The `source_rate` argument is a legacy hint only; actual conversion
-    /// uses [`AudioChunk::sample_rate`] on each [`Self::process`] call.
+    /// Create a resampler. If `source_rate == target_rate`, no resampler is allocated.
     pub fn new(source_rate: u32, target_rate: u32) -> Result<Self, VoxError> {
-        let _ = source_rate;
-        Ok(Self {
-            resampler: None,
-            active_source_rate: None,
-            target_rate,
-        })
-    }
+        let resampler = if source_rate != target_rate {
+            let params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                oversampling_factor: 128,
+                interpolation: SincInterpolationType::Cubic,
+                window: WindowFunction::BlackmanHarris2,
+            };
 
-    fn ensure_resampler(&mut self, source_rate: u32) -> Result<(), VoxError> {
-        if self.active_source_rate == Some(source_rate) && self.resampler.is_some() {
-            return Ok(());
-        }
+            let ratio = target_rate as f64 / source_rate as f64;
+            // Use a reasonable chunk size for the input
+            let chunk_size = 1024;
 
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            oversampling_factor: 128,
-            interpolation: SincInterpolationType::Cubic,
-            window: WindowFunction::BlackmanHarris2,
+            let r = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_size, 1)
+                .map_err(|e| VoxError::Audio(format!("failed to create resampler: {e}")))?;
+            Some(r)
+        } else {
+            None
         };
 
-        let ratio = self.target_rate as f64 / source_rate as f64;
-        let chunk_size = 1024;
-
-        let r = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_size, 1)
-            .map_err(|e| VoxError::Audio(format!("failed to create resampler: {e}")))?;
-
-        self.resampler = Some(r);
-        self.active_source_rate = Some(source_rate);
-        info!(
-            from_hz = source_rate,
-            to_hz = self.target_rate,
-            "audio resampler active (mic rate differs from VAD 16 kHz)"
-        );
-        Ok(())
+        Ok(Self {
+            resampler,
+            source_rate,
+            target_rate,
+        })
     }
 
     /// Resample an audio chunk. Also converts stereo to mono if needed.
@@ -70,50 +57,45 @@ impl AudioResampler {
             chunk.samples.clone()
         };
 
-        let source_rate = chunk.sample_rate;
+        // Step 2: Resample if needed
+        let resampled = match self.resampler.as_mut() {
+            Some(resampler) => {
+                let input_frames_max = resampler.input_frames_max();
+                let mut output = Vec::new();
 
-        // Step 2: Resample when the capture rate differs from VAD/STT target rate
-        let resampled = if source_rate == self.target_rate {
-            self.resampler = None;
-            self.active_source_rate = None;
-            mono_samples
-        } else {
-            self.ensure_resampler(source_rate)?;
-            let resampler = self
-                .resampler
-                .as_mut()
-                .expect("resampler set by ensure_resampler");
-            let input_frames_max = resampler.input_frames_max();
-            let mut output = Vec::new();
+                // Process in chunks that match the resampler's expected input size
+                let mut offset = 0;
+                while offset < mono_samples.len() {
+                    let end = (offset + input_frames_max).min(mono_samples.len());
+                    let mut input_chunk = mono_samples[offset..end].to_vec();
 
-            let mut offset = 0;
-            while offset < mono_samples.len() {
-                let end = (offset + input_frames_max).min(mono_samples.len());
-                let mut input_chunk = mono_samples[offset..end].to_vec();
-
-                if input_chunk.len() < input_frames_max {
-                    input_chunk.resize(input_frames_max, 0.0);
-                }
-
-                let input = vec![input_chunk];
-                let result = resampler
-                    .process(&input, None)
-                    .map_err(|e| VoxError::Audio(format!("resample error: {e}")))?;
-
-                if let Some(channel) = result.into_iter().next() {
-                    if end - offset < input_frames_max {
-                        let valid_ratio = (end - offset) as f64 / input_frames_max as f64;
-                        let valid_output = (channel.len() as f64 * valid_ratio) as usize;
-                        output.extend_from_slice(&channel[..valid_output]);
-                    } else {
-                        output.extend(channel);
+                    // Pad with zeros if the last chunk is smaller than expected
+                    if input_chunk.len() < input_frames_max {
+                        input_chunk.resize(input_frames_max, 0.0);
                     }
+
+                    let input = vec![input_chunk];
+                    let result = resampler
+                        .process(&input, None)
+                        .map_err(|e| VoxError::Audio(format!("resample error: {e}")))?;
+
+                    if let Some(channel) = result.into_iter().next() {
+                        // If we padded the input, trim proportionally
+                        if end - offset < input_frames_max {
+                            let valid_ratio = (end - offset) as f64 / input_frames_max as f64;
+                            let valid_output = (channel.len() as f64 * valid_ratio) as usize;
+                            output.extend_from_slice(&channel[..valid_output]);
+                        } else {
+                            output.extend(channel);
+                        }
+                    }
+
+                    offset += input_frames_max;
                 }
 
-                offset += input_frames_max;
+                output
             }
-
-            output
+            None => mono_samples,
         };
 
         Ok(AudioChunk {
@@ -169,15 +151,9 @@ mod tests {
 
     #[test]
     fn resampler_creates_for_different_rates() {
-        let mut r = AudioResampler::new(44100, 16000).unwrap();
-        let chunk = AudioChunk {
-            samples: vec![0.5; 4410],
-            sample_rate: 44100,
-            channels: 1,
-        };
-        let out = r.process(&chunk).unwrap();
-        assert!(!out.samples.is_empty());
-        assert_eq!(out.sample_rate, 16000);
+        let r = AudioResampler::new(44100, 16000);
+        assert!(r.is_ok());
+        assert!(r.unwrap().resampler.is_some());
     }
 
     #[test]

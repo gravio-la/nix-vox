@@ -10,11 +10,10 @@ use crate::types::{AudioChunk, Utterance};
 /// Frame size expected by Silero VAD v5 at 16 kHz (one streaming step).
 const FRAME_SIZE: usize = 512;
 
-/// ONNX receives **context + frame**: 64 past samples + 512 current (see upstream `OnnxWrapper`).
-/// https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/utils_vad.py
+/// Upstream ONNX prepends this many samples before each 512-sample frame (`OnnxWrapper` in silero-vad).
+/// Input length at 16 kHz is therefore 64 + 512 = 576.
 const CONTEXT_SIZE_16K: usize = 64;
 
-/// Full length of the `input` tensor at 16 kHz.
 const ONNX_INPUT_SAMPLES_16K: usize = CONTEXT_SIZE_16K + FRAME_SIZE;
 
 /// Sample rate expected by Silero VAD.
@@ -61,7 +60,7 @@ impl Default for VadConfig {
 pub struct SileroVad {
     session: Session,
     state: Vec<f32>,
-    /// Last 64 samples of the previous ONNX input tail (matches Python `self._context`).
+    /// Carried across frames; matches Python `self._context` in `OnnxWrapper`.
     context_16k: [f32; CONTEXT_SIZE_16K],
     config: VadConfig,
     is_speaking: bool,
@@ -72,8 +71,6 @@ pub struct SileroVad {
     lookback_buffer: VecDeque<f32>,
     /// Maximum number of samples to keep in the lookback buffer.
     lookback_capacity: usize,
-    /// Counts VAD frames for periodic diagnostics (~1 Hz at 16 kHz / 512 samples).
-    vad_frame_seq: u64,
 }
 
 impl SileroVad {
@@ -112,13 +109,12 @@ impl SileroVad {
             speech_frames: 0,
             lookback_buffer: VecDeque::with_capacity(lookback_capacity),
             lookback_capacity,
-            vad_frame_seq: 0,
         })
     }
 
     /// Run inference on a single 512-sample frame and return speech probability.
     ///
-    /// The v5 ONNX model expects shape `[1, 576]` = `[context (64) || frame (512)]`, not raw 512.
+    /// The v5 ONNX model expects `[1, 576]` = concat(context, frame), not raw `[1, 512]`.
     fn infer(&mut self, frame: &[f32]) -> Result<f32, VoxError> {
         debug_assert_eq!(frame.len(), FRAME_SIZE);
 
@@ -158,7 +154,6 @@ impl SileroVad {
             .map_err(|e| VoxError::Vad(format!("failed to extract stateN: {e}")))?;
         self.state.copy_from_slice(state_data);
 
-        // Same as Python: `self._context = x[..., -context_size:]`
         self.context_16k
             .copy_from_slice(&frame[FRAME_SIZE - CONTEXT_SIZE_16K..]);
 
@@ -170,18 +165,8 @@ impl SileroVad {
 impl VadBackend for SileroVad {
     async fn process_frame(&mut self, frame: &AudioChunk) -> Result<Vec<VadEvent>, VoxError> {
         let probability = self.infer(&frame.samples)?;
-        self.vad_frame_seq += 1;
-        // ~1 Hz at 16 kHz / 512-sample frames: helps spot "VAD runs but prob never crosses threshold"
-        // (quiet U8 capture, wrong device, etc.) without RUST_LOG=trace.
-        if self.vad_frame_seq % 31 == 0 {
-            tracing::info!(
-                silero_speech_prob = probability,
-                vad_threshold = self.config.speech_threshold,
-                is_speaking = self.is_speaking,
-                "silero VAD sample — speech starts when prob >= vad_threshold (raise VOX_MIC_GAIN or OS input level if prob stays ~0)"
-            );
-        }
-        // Per-frame trace for deep debugging.
+        // Per-frame trace (only visible at RUST_LOG=trace) so we can see
+        // what Silero actually emits when debugging pipeline issues.
         tracing::trace!(
             prob = probability,
             is_speaking = self.is_speaking,
@@ -228,12 +213,6 @@ impl VadBackend for SileroVad {
                         speaker_id: None,
                     };
                     events.push(VadEvent::SpeechEnd(utterance));
-                } else {
-                    tracing::info!(
-                        speech_ms,
-                        min_speech_ms = self.config.min_speech_ms,
-                        "VAD: dropped short speech segment (below min_speech_ms); no STT run"
-                    );
                 }
                 // Reset segmentation state regardless of whether we emitted.
                 self.is_speaking = false;
