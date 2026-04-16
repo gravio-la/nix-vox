@@ -3,13 +3,16 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::error::VoxError;
 use crate::types::AudioChunk;
 
-/// Default chunk size in samples (30ms at 16kHz, matches Silero VAD frame size).
-const DEFAULT_CHUNK_SIZE: usize = 480;
+/// Default chunk size in samples at the pipeline reference rate (16 kHz).
+/// Silero VAD uses 512-sample frames (32 ms); we scale this by `actual_rate / 16 kHz`
+/// so each capture callback delivers an integer number of **mono** samples that
+/// resample to a multiple of the VAD frame size when the device runs at 16/48 kHz.
+const DEFAULT_CHUNK_SIZE: usize = 512;
 
 /// Captures audio from the system's default input device and streams
 /// it as [`AudioChunk`]s through a tokio mpsc channel.
@@ -21,7 +24,8 @@ impl AudioCapture {
     /// Create a new capture from the default input device.
     ///
     /// Returns `Self` and an `mpsc::Receiver<AudioChunk>` that streams audio
-    /// chunks of approximately 30ms each.
+    /// chunks of approximately one Silero frame duration at 16 kHz (32 ms when
+    /// `sample_rate` is 16000).
     pub fn new(
         sample_rate: u32,
         channels: u16,
@@ -47,7 +51,8 @@ impl AudioCapture {
         // Compute chunk size scaled to actual device sample rate
         let chunk_size = (DEFAULT_CHUNK_SIZE as f64 * actual_rate as f64 / 16000.0) as usize;
 
-        let (tx, rx) = mpsc::channel::<AudioChunk>(64);
+        // Large enough that brief ONNX/VAD stalls do not drop chunks (drops sound like silence to VAD).
+        let (tx, rx) = mpsc::channel::<AudioChunk>(256);
 
         let stream_config: StreamConfig = config.clone().into();
         let sample_format = config.sample_format();
@@ -154,8 +159,7 @@ impl AudioCapture {
                     sample_rate,
                     channels,
                 };
-                // Non-blocking send — drop chunk if receiver is full
-                let _ = tx.try_send(chunk);
+                Self::try_send_chunk(&tx, chunk);
             }
         }
     }
@@ -180,7 +184,7 @@ impl AudioCapture {
                     sample_rate,
                     channels,
                 };
-                let _ = tx.try_send(chunk);
+                Self::try_send_chunk(&tx, chunk);
             }
         }
     }
@@ -205,8 +209,18 @@ impl AudioCapture {
                     sample_rate,
                     channels,
                 };
-                let _ = tx.try_send(chunk);
+                Self::try_send_chunk(&tx, chunk);
             }
+        }
+    }
+
+    fn try_send_chunk(tx: &mpsc::Sender<AudioChunk>, chunk: AudioChunk) {
+        match tx.try_send(chunk) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("dropped microphone chunk (capture queue full); VAD may miss speech");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }

@@ -3,14 +3,29 @@
 #[cfg(feature = "distil-whisper")]
 use super::models::{distil_whisper_download_name, distil_whisper_model_filename};
 use super::models::{ensure_model, model_filename, whisper_download_name};
-use vox::{SileroVad, Vox};
+use vox::{SileroVad, VadConfig, Vox, WhisperBackend, WhisperConfig};
 
 /// Run the listen command.
 pub async fn run(model: &str, stt_backend: &str, yes: bool) -> anyhow::Result<()> {
+    if std::env::var("RUST_LOG").is_err() {
+        eprintln!(
+            "Tip: set RUST_LOG=info for mic level + Silero hints; if no transcripts, try VOX_MIC_GAIN=4 \
+             (quiet U8/ALSA capture)."
+        );
+    }
+
     let vad_path = ensure_model("silero-vad", "silero_vad.onnx", yes).await?;
 
     println!("Loading VAD model...");
-    let vad = SileroVad::new(&vad_path)?;
+    // Slightly more sensitive than Silero defaults — quiet USB / ALSA inputs often sit below 0.5.
+    let vad = SileroVad::with_config(
+        &vad_path,
+        VadConfig {
+            speech_threshold: 0.2,
+            min_speech_ms: 200,
+            ..Default::default()
+        },
+    )?;
 
     match stt_backend {
         "whisper" => run_whisper(model, vad, yes).await,
@@ -50,7 +65,22 @@ async fn run_whisper(model: &str, vad: SileroVad, yes: bool) -> anyhow::Result<(
     let whisper_path = ensure_model(&whisper_name, &whisper_file, yes).await?;
 
     println!("Loading Whisper model ({model})...");
-    let stt = vox::WhisperBackend::from_model(&whisper_path)?;
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4);
+    let language = if model.contains(".en") {
+        Some("en".to_string())
+    } else {
+        None
+    };
+    let stt = WhisperBackend::with_config(WhisperConfig {
+        model_path: whisper_path,
+        language,
+        translate: false,
+        n_threads,
+        // After VAD, segments are often still borderline for whisper's no_speech heuristic.
+        no_speech_probability_max: 0.78,
+    })?;
 
     let vox = Vox::builder()
         .vad(vad)

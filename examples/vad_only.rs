@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (capture, mut audio_rx) = AudioCapture::new(16000, 1)?;
     let mut resampler = AudioResampler::new(16000, target_rate)?;
+    let mut frame_carry: Vec<f32> = Vec::with_capacity(frame_size * 2);
 
     capture.start()?;
     println!("Listening for speech... (Ctrl+C to stop)");
@@ -36,14 +37,13 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let resampled = resampler.process(&chunk)?;
+                frame_carry.extend_from_slice(&resampled.samples);
 
-                for frame_samples in resampled.samples.chunks(frame_size) {
-                    if frame_samples.len() < frame_size {
-                        continue;
-                    }
+                while frame_carry.len() >= frame_size {
+                    let frame_samples: Vec<f32> = frame_carry.drain(..frame_size).collect();
 
                     let frame = vox::AudioChunk {
-                        samples: frame_samples.to_vec(),
+                        samples: frame_samples,
                         sample_rate: target_rate,
                         channels: 1,
                     };

@@ -7,8 +7,15 @@ use crate::error::VoxError;
 use crate::traits::{VadBackend, VadEvent};
 use crate::types::{AudioChunk, Utterance};
 
-/// Frame size expected by Silero VAD v5 at 16 kHz.
+/// Frame size expected by Silero VAD v5 at 16 kHz (one streaming step).
 const FRAME_SIZE: usize = 512;
+
+/// ONNX receives **context + frame**: 64 past samples + 512 current (see upstream `OnnxWrapper`).
+/// https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/utils_vad.py
+const CONTEXT_SIZE_16K: usize = 64;
+
+/// Full length of the `input` tensor at 16 kHz.
+const ONNX_INPUT_SAMPLES_16K: usize = CONTEXT_SIZE_16K + FRAME_SIZE;
 
 /// Sample rate expected by Silero VAD.
 const SAMPLE_RATE: u32 = 16_000;
@@ -54,6 +61,8 @@ impl Default for VadConfig {
 pub struct SileroVad {
     session: Session,
     state: Vec<f32>,
+    /// Last 64 samples of the previous ONNX input tail (matches Python `self._context`).
+    context_16k: [f32; CONTEXT_SIZE_16K],
     config: VadConfig,
     is_speaking: bool,
     silence_frames: u32,
@@ -63,6 +72,8 @@ pub struct SileroVad {
     lookback_buffer: VecDeque<f32>,
     /// Maximum number of samples to keep in the lookback buffer.
     lookback_capacity: usize,
+    /// Counts VAD frames for periodic diagnostics (~1 Hz at 16 kHz / 512 samples).
+    vad_frame_seq: u64,
 }
 
 impl SileroVad {
@@ -93,6 +104,7 @@ impl SileroVad {
         Ok(Self {
             session,
             state: vec![0.0; STATE_LEN],
+            context_16k: [0.0; CONTEXT_SIZE_16K],
             config,
             is_speaking: false,
             silence_frames: 0,
@@ -100,14 +112,24 @@ impl SileroVad {
             speech_frames: 0,
             lookback_buffer: VecDeque::with_capacity(lookback_capacity),
             lookback_capacity,
+            vad_frame_seq: 0,
         })
     }
 
     /// Run inference on a single 512-sample frame and return speech probability.
+    ///
+    /// The v5 ONNX model expects shape `[1, 576]` = `[context (64) || frame (512)]`, not raw 512.
     fn infer(&mut self, frame: &[f32]) -> Result<f32, VoxError> {
         debug_assert_eq!(frame.len(), FRAME_SIZE);
 
-        let input_audio = TensorRef::from_array_view(([1usize, FRAME_SIZE], frame))
+        let mut onnx_input = [0.0f32; ONNX_INPUT_SAMPLES_16K];
+        onnx_input[..CONTEXT_SIZE_16K].copy_from_slice(&self.context_16k);
+        onnx_input[CONTEXT_SIZE_16K..].copy_from_slice(frame);
+
+        let input_audio = TensorRef::from_array_view((
+            [1usize, ONNX_INPUT_SAMPLES_16K],
+            onnx_input.as_slice(),
+        ))
             .map_err(|e| VoxError::Vad(format!("failed to create input tensor: {e}")))?;
 
         let sr_data: [i64; 1] = [SAMPLE_RATE as i64];
@@ -136,6 +158,10 @@ impl SileroVad {
             .map_err(|e| VoxError::Vad(format!("failed to extract stateN: {e}")))?;
         self.state.copy_from_slice(state_data);
 
+        // Same as Python: `self._context = x[..., -context_size:]`
+        self.context_16k
+            .copy_from_slice(&frame[FRAME_SIZE - CONTEXT_SIZE_16K..]);
+
         Ok(probability)
     }
 }
@@ -144,8 +170,18 @@ impl SileroVad {
 impl VadBackend for SileroVad {
     async fn process_frame(&mut self, frame: &AudioChunk) -> Result<Vec<VadEvent>, VoxError> {
         let probability = self.infer(&frame.samples)?;
-        // Per-frame trace (only visible at RUST_LOG=trace) so we can see
-        // what Silero actually emits when debugging pipeline issues.
+        self.vad_frame_seq += 1;
+        // ~1 Hz at 16 kHz / 512-sample frames: helps spot "VAD runs but prob never crosses threshold"
+        // (quiet U8 capture, wrong device, etc.) without RUST_LOG=trace.
+        if self.vad_frame_seq % 31 == 0 {
+            tracing::info!(
+                silero_speech_prob = probability,
+                vad_threshold = self.config.speech_threshold,
+                is_speaking = self.is_speaking,
+                "silero VAD sample — speech starts when prob >= vad_threshold (raise VOX_MIC_GAIN or OS input level if prob stays ~0)"
+            );
+        }
+        // Per-frame trace for deep debugging.
         tracing::trace!(
             prob = probability,
             is_speaking = self.is_speaking,
@@ -192,6 +228,12 @@ impl VadBackend for SileroVad {
                         speaker_id: None,
                     };
                     events.push(VadEvent::SpeechEnd(utterance));
+                } else {
+                    tracing::info!(
+                        speech_ms,
+                        min_speech_ms = self.config.min_speech_ms,
+                        "VAD: dropped short speech segment (below min_speech_ms); no STT run"
+                    );
                 }
                 // Reset segmentation state regardless of whether we emitted.
                 self.is_speaking = false;
@@ -217,6 +259,7 @@ impl VadBackend for SileroVad {
 
     fn reset(&mut self) {
         self.state.fill(0.0);
+        self.context_16k.fill(0.0);
         self.is_speaking = false;
         self.silence_frames = 0;
         self.speech_buffer.clear();
