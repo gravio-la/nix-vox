@@ -135,6 +135,7 @@
             buildInputs =
               with pkgs;
               [ openssl ]
+              ++ lib.optionals stdenv.isLinux [ alsa-lib ]
               ++ lib.optionals stdenv.isDarwin (
                 with darwin.apple_sdk.frameworks;
                 [
@@ -147,6 +148,7 @@
               "vox"
               "--bin"
               "vox-mcp"
+              "--no-default-features"
               "--features"
               "mcp"
             ];
