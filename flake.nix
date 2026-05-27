@@ -125,6 +125,44 @@
               };
             };
 
+          mkVoxMcp = rustPlatform.buildRustPackage {
+            pname = "vox-mcp";
+            version = "0.6.0";
+            src = voxSrc;
+            cargoLock.lockFile = ./Cargo.lock;
+            strictDeps = true;
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs =
+              with pkgs;
+              [ openssl ]
+              ++ lib.optionals stdenv.isDarwin (
+                with darwin.apple_sdk.frameworks;
+                [
+                  Security
+                  SystemConfiguration
+                ]
+              );
+            cargoBuildFlags = [
+              "-p"
+              "vox"
+              "--bin"
+              "vox-mcp"
+              "--features"
+              "mcp"
+            ];
+            doCheck = false;
+            meta = {
+              description = "Vox MCP server — expose Vox voice AI to Claude Desktop and other MCP clients";
+              homepage = "https://github.com/mrtozner/vox";
+              license = with lib.licenses; [
+                mit
+                asl20
+              ];
+              mainProgram = "vox-mcp";
+              platforms = lib.platforms.unix;
+            };
+          };
+
           mkVox =
             {
               pname,
@@ -265,6 +303,7 @@
             withPiper = true;
             metaDescription = "Local-first voice AI (Piper TTS build)";
           };
+          "vox-mcp" = mkVoxMcp;
           "vox-kokoro" = mkVox {
             pname = "vox-kokoro";
             features = voxFeaturesKokoro;
@@ -309,6 +348,10 @@
           "vox-qwen3" = {
             type = "app";
             program = "${self.packages.${system}."vox-qwen3"}/bin/vox";
+          };
+          "vox-mcp" = {
+            type = "app";
+            program = "${self.packages.${system}."vox-mcp"}/bin/vox-mcp";
           };
           # Audible smoke test (Piper): requires audio output device
           speak-demo = {

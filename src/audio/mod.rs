@@ -15,7 +15,8 @@ mod resampler;
     feature = "chatterbox",
     feature = "piper",
     feature = "qwen3",
-    feature = "tts"
+    feature = "tts",
+    feature = "mcp"
 ))]
 mod playback;
 
@@ -29,6 +30,7 @@ pub use resampler::AudioResampler;
     feature = "chatterbox",
     feature = "piper",
     feature = "qwen3",
-    feature = "tts"
+    feature = "tts",
+    feature = "mcp"
 ))]
 pub use playback::AudioPlayer;

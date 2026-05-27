@@ -131,6 +131,7 @@ pub use intelligence::{
     feature = "chatterbox",
     feature = "piper",
     feature = "qwen3",
-    feature = "tts"
+    feature = "tts",
+    feature = "mcp"
 ))]
 pub use audio::AudioPlayer;
