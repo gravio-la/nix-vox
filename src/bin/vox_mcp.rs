@@ -339,6 +339,13 @@ impl ServerHandler for VoxMcpServer {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn default_server_url() -> String {
+    let port = std::env::var("VOX_PORT")
+        .or_else(|_| std::env::var("PORT"))
+        .unwrap_or_else(|_| "3000".into());
+    format!("http://localhost:{port}")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Logs must go to stderr — stdout is reserved for the MCP stdio transport.
@@ -352,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
         .windows(2)
         .find(|w| w[0] == "--server-url")
         .map(|w| w[1].clone())
-        .unwrap_or_else(|| "http://localhost:3000".to_string());
+        .unwrap_or_else(default_server_url);
 
     tracing::info!("vox-mcp connecting to {}", server_url);
 
